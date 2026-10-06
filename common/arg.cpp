@@ -4270,6 +4270,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_N_GPU_LAYERS_DRAFT"));
     add_opt(common_arg(
+        {"--spec-draft-kv-ram"},
+        {"--no-spec-draft-kv-ram"},
+        string_format("give the draft its own KV cache in host RAM, next to the draft layers, instead of sharing the target's VRAM KV (default: %s)",
+                      params.speculative.draft.kv_ram ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.speculative.draft.kv_ram = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-draft-ubatch"}, "N",
+        "physical batch of the draft context (default: 256, or 4096 with --spec-draft-kv-ram)",
+        [](common_params & params, int value) {
+            params.speculative.draft.n_ubatch = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
         {"--spec-draft-model", "-md", "--model-draft"}, "FNAME",
         "draft model for speculative decoding (default: unused)",
         [](common_params & params, const std::string & value) {

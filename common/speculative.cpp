@@ -1414,7 +1414,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ false);
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
 
-        is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
+        // SPEC_DRAFT_KV_RAM: force the draft to keep a PRIVATE KV cache instead of sharing the
+        // target's.  ctx_other is set unconditionally when the draft ctx is created, so the
+        // pointer comparison below is true for every draft and the gemma4 shared-KV path is the
+        // only one ever taken; for qwen35 / qwen35moe the intended mode is a private KV, built in
+        // process() from the target embeddings (catch-up decode, see !is_mem_shared below).
+        is_mem_shared = !this->params.kv_ram && llama_get_ctx_other(ctx_dft) == ctx_tgt;
         chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
 
         if (chain_heads) {
@@ -2531,6 +2536,35 @@ common_speculative_init_result::common_speculative_init_result(
 
     // the draft context holds as many tokens per sequence as the target context
     cparams.n_ctx = llama_n_ctx(ctx_tgt);
+
+    // MOE_DRAFT_UBATCH: cap the physical batch of the DRAFT context only.
+    // The draft context inherits n_ubatch from the target (common.cpp: cparams.n_ubatch = params.n_ubatch)
+    // and a DFlash draft allocates its logits as [1, n_vocab, n_outputs] with
+    // n_outputs = the whole batch (models/dflash.cpp), i.e. n_vocab * n_ubatch * 4 bytes:
+    // with the Gemma draft (vocab 262144) and ubatch 3072 that is a 3.2 GiB single allocation
+    // that makes the draft impossible to load on a 12 GiB card. 256 keeps it at ~268 MB.
+    // llama.cpp splits a logical batch into physical sub-batches, so this changes the draft's
+    // SPEED (more sub-batches while it consumes the context), not its result.
+    //
+    // SPEC_DRAFT_UBATCH: when the draft runs in host RAM there is no 12 GiB budget to respect --
+    // the logits buffer is host memory and 126 GB are available -- and a big batch is exactly
+    // what makes the prefill catch-up (the pass that builds the draft's own KV) fast.
+    const uint32_t draft_ubatch = params.speculative.draft.n_ubatch > 0
+        ? (uint32_t) params.speculative.draft.n_ubatch
+        : (params.speculative.draft.kv_ram ? 4096u : 256u);
+    cparams.n_ubatch = std::min(cparams.n_ubatch, draft_ubatch);
+
+    // SPEC_DRAFT_KV_RAM: keep the draft KV cache in host RAM, next to the draft layers.
+    // cparams is derived from the target params, so offload_kqv is inherited from the target;
+    // forcing it off allocates the draft KV on the CPU.  ctx_other stays set (dflash requires it).
+    if (params.speculative.draft.kv_ram) {
+        cparams.offload_kqv = false;
+        if (params.speculative.draft.n_gpu_layers == 0) {
+            cparams.op_offload = false;
+            LOG_INF("%s: CPU/RAM draft: KV and operations stay on CPU, n_ubatch=%u\n",
+                    __func__, cparams.n_ubatch);
+        }
+    }
 
     // note: for small models maybe we can set this to the maximum possible draft from all speculative types
     //       the extra memory for small models is likely negligible?

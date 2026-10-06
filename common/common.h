@@ -338,6 +338,19 @@ struct common_params_speculative_draft {
 
     int32_t n_gpu_layers = -1; // number of layers to store in VRAM for the draft model (-1 - use default)
 
+    // SPEC_DRAFT_KV_RAM: give the draft its OWN KV cache, allocated on the CPU next to the draft
+    // layers, instead of sharing the target's KV in VRAM.  Sharing is the gemma4 mode (one KV,
+    // all heads in one graph); for qwen35 / qwen35moe the intended mode is a private KV built in
+    // process() from the target embeddings (catch-up decode).  ctx_other stays set either way.
+    bool kv_ram = false;
+
+    // SPEC_DRAFT_UBATCH: physical batch of the draft context.  0 = auto (256 normally, 4096 with
+    // kv_ram).  The DFlash draft allocates its logits as [1, n_vocab, n_outputs] with n_outputs =
+    // the whole batch, i.e. n_vocab * n_ubatch * 4 bytes: on a 12 GiB card that must stay small,
+    // but when the draft lives in host RAM the same buffer is cheap and a big batch is what makes
+    // the prefill catch-up (and therefore the draft's own KV) fast.
+    int32_t n_ubatch = 0;
+
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
 
