@@ -1,0 +1,35 @@
+llama.cpp — provenance and attribution for this fork
+
+This repository is a fork of thecodacus/llama.cpp (branch `perf`), which is
+itself a fork of ggml-org/llama.cpp. The chain is:
+
+    ggml-org/llama.cpp          upstream, MIT, Copyright (c) 2023-2026 The ggml authors
+      +-- thecodacus/llama.cpp  branch `perf`
+            +-- this repository branch `perf`
+
+The upstream license is unchanged and untouched: see LICENSE.
+
+Work present in this fork that comes from NEITHER upstream NOR thecodacus:
+
+  * MoE expert cache extended to the fused gate_up expert layout (e.g.
+    gemma4), expert activation GELU as well as SILU, per-expert output
+    scales applied in the pack path, and the pack gated to decode-sized
+    batches
+      src/llama-graph.cpp, src/llama-model.cpp, src/llama-model.h,
+      src/models/gemma4.cpp
+
+  * Speculative draft placed in host RAM, so its KV and its operations stay
+    on the CPU next to the draft layers
+      common/arg.cpp (--spec-draft-kv-ram, --spec-draft-ubatch),
+      common/common.h, common/speculative.cpp
+
+  * Private CPU copies of the weights a draft borrows from its target, so a
+    CPU-placed draft does not silently keep running part of its graph on the
+    GPU
+      src/llama-model-loader.cpp, src/llama-model-loader.h,
+      src/models/dflash.cpp, src/llama-model.cpp
+
+The MoE expert cache itself (--moe-cache-profile / --moe-cache-slots) is the
+work of thecodacus/llama.cpp branch `perf`; this fork extends it.
+
+No upstream copyright notice has been removed, altered, or relocated.

@@ -1,5 +1,10 @@
 # llama.cpp
 
+> **This is a personal fork.** It is a fork of
+> [thecodacus/llama.cpp](https://github.com/thecodacus/llama.cpp) (branch `perf`), which is itself a
+> fork of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp). See [NOTICE](NOTICE) for the
+> full provenance and for exactly what this fork adds. MIT license, upstream copyright untouched.
+
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
 
 <div align="center">
