@@ -1899,11 +1899,25 @@ void llama_model_base::init_moe_expert_cache() {
 
     // candidate layers: routed experts resident in host memory
     std::vector<int> pack_layers;
-    for (int il = 0; il < (int) layers.size(); il++) {
-        const auto & l = layers[il];
-        if (l.ffn_gate_exps && l.ffn_up_exps && l.ffn_down_exps && freq.count(il) &&
-            l.ffn_gate_exps->buffer && ggml_backend_buft_is_host(ggml_backend_buffer_get_type(l.ffn_gate_exps->buffer))) {
-            pack_layers.push_back(il);
+    {
+        for (int il = 0; il < (int) layers.size(); il++) {
+            const auto & l = layers[il];
+
+            // two expert layouts exist: the split one (gate + up + down), used by
+            // e.g. qwen35moe, and the fused one (gate_up + down), used by e.g.
+            // gemma4. Both can be packed, so accept either of them.
+            const bool has_split = l.ffn_gate_exps    && l.ffn_up_exps && l.ffn_down_exps;
+            const bool has_fused = l.ffn_gate_up_exps && l.ffn_down_exps;
+            if (!has_split && !has_fused) { continue; }
+
+            // down exists in both layouts and carries the expert count, so it is
+            // the tensor used to decide where the layer currently lives
+            const ggml_tensor * anchor = l.ffn_down_exps;
+            const bool in_freq = freq.count(il) > 0;
+            const bool has_buf = anchor->buffer != nullptr;
+            const bool is_host = has_buf && ggml_backend_buft_is_host(ggml_backend_buffer_get_type(anchor->buffer));
+
+            if (in_freq && has_buf && is_host) { pack_layers.push_back(il); }
         }
     }
     if (pack_layers.empty()) {
@@ -1920,19 +1934,30 @@ void llama_model_base::init_moe_expert_cache() {
 
     for (int il : pack_layers) {
         auto & l = layers[il];
-        const ggml_tensor * g = l.ffn_gate_exps;
-        const ggml_tensor * u = l.ffn_up_exps;
-        const ggml_tensor * d = l.ffn_down_exps;
-        const int64_t n_expert = g->ne[2];
+
+        const int64_t n_expert = l.ffn_down_exps->ne[2];
         const int64_t S = std::min<int64_t>(n_slots, n_expert);
-        l.ffn_gate_exps_hot = ggml_new_tensor_3d(ctx, g->type, g->ne[0], g->ne[1], S);
-        l.ffn_up_exps_hot   = ggml_new_tensor_3d(ctx, u->type, u->ne[0], u->ne[1], S);
-        l.ffn_down_exps_hot = ggml_new_tensor_3d(ctx, d->type, d->ne[0], d->ne[1], S);
+        const bool fused = l.ffn_gate_up_exps != nullptr;
+
+        l.ffn_down_exps_hot = ggml_new_tensor_3d(ctx, l.ffn_down_exps->type,
+                                                 l.ffn_down_exps->ne[0], l.ffn_down_exps->ne[1], S);
+        ggml_format_name(l.ffn_down_exps_hot, "blk.%d.ffn_down_exps_hot", il);
+
+        if (fused) {
+            const ggml_tensor * gu = l.ffn_gate_up_exps;
+            l.ffn_gate_up_exps_hot = ggml_new_tensor_3d(ctx, gu->type, gu->ne[0], gu->ne[1], S);
+            ggml_format_name(l.ffn_gate_up_exps_hot, "blk.%d.ffn_gate_up_exps_hot", il);
+        } else {
+            const ggml_tensor * g = l.ffn_gate_exps;
+            const ggml_tensor * u = l.ffn_up_exps;
+            l.ffn_gate_exps_hot = ggml_new_tensor_3d(ctx, g->type, g->ne[0], g->ne[1], S);
+            l.ffn_up_exps_hot   = ggml_new_tensor_3d(ctx, u->type, u->ne[0], u->ne[1], S);
+            ggml_format_name(l.ffn_gate_exps_hot, "blk.%d.ffn_gate_exps_hot", il);
+            ggml_format_name(l.ffn_up_exps_hot,   "blk.%d.ffn_up_exps_hot",   il);
+        }
+
         l.moe_map_hot       = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, n_expert);
         l.moe_map_cold      = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, n_expert);
-        ggml_format_name(l.ffn_gate_exps_hot, "blk.%d.ffn_gate_exps_hot", il);
-        ggml_format_name(l.ffn_up_exps_hot,   "blk.%d.ffn_up_exps_hot",   il);
-        ggml_format_name(l.ffn_down_exps_hot, "blk.%d.ffn_down_exps_hot", il);
         ggml_format_name(l.moe_map_hot,  "blk.%d.moe_map_hot",  il);
         ggml_format_name(l.moe_map_cold, "blk.%d.moe_map_cold", il);
     }
@@ -1944,6 +1969,7 @@ void llama_model_base::init_moe_expert_cache() {
         for (int il : pack_layers) {
             auto & l = layers[il];
             l.ffn_gate_exps_hot = l.ffn_up_exps_hot = l.ffn_down_exps_hot = nullptr;
+            l.ffn_gate_up_exps_hot = nullptr;
             l.moe_map_hot = l.moe_map_cold = nullptr;
         }
         return;
@@ -1959,8 +1985,9 @@ void llama_model_base::init_moe_expert_cache() {
     size_t total_bytes = 0;
     for (int il : pack_layers) {
         auto & l = layers[il];
-        const int64_t n_expert = l.ffn_gate_exps->ne[2];
-        const int64_t S = l.ffn_gate_exps_hot->ne[2];
+        const int64_t n_expert = l.ffn_down_exps->ne[2];
+        const int64_t S = l.ffn_down_exps_hot->ne[2];
+        const bool fused = l.ffn_gate_up_exps != nullptr;
 
         std::vector<std::pair<int64_t, int32_t>> ranked; // (-count, expert)
         for (const auto & [e, c] : freq[il]) {
@@ -1979,9 +2006,22 @@ void llama_model_base::init_moe_expert_cache() {
             const int32_t e = ranked[s].second;
             map_hot[e]  = (int32_t) s;
             map_cold[e] = -1;
-            const ggml_tensor * srcs[3] = { l.ffn_gate_exps, l.ffn_up_exps, l.ffn_down_exps };
-            ggml_tensor * dsts[3] = { l.ffn_gate_exps_hot, l.ffn_up_exps_hot, l.ffn_down_exps_hot };
-            for (int t = 0; t < 3; t++) {
+            // one expert is a contiguous slab of nb[2] bytes (the expert dim is
+            // outermost in every tensor), so a byte copy moves it to its slot
+            const ggml_tensor * srcs[3];
+            ggml_tensor * dsts[3];
+            int n_tensors = 0;
+            if (fused) {
+                srcs[0] = l.ffn_gate_up_exps; dsts[0] = l.ffn_gate_up_exps_hot;
+                srcs[1] = l.ffn_down_exps;    dsts[1] = l.ffn_down_exps_hot;
+                n_tensors = 2;
+            } else {
+                srcs[0] = l.ffn_gate_exps; dsts[0] = l.ffn_gate_exps_hot;
+                srcs[1] = l.ffn_up_exps;   dsts[1] = l.ffn_up_exps_hot;
+                srcs[2] = l.ffn_down_exps; dsts[2] = l.ffn_down_exps_hot;
+                n_tensors = 3;
+            }
+            for (int t = 0; t < n_tensors; t++) {
                 const size_t nb = srcs[t]->nb[2];
                 slab.resize(nb);
                 ggml_backend_tensor_get(srcs[t], slab.data(), e*nb, nb);

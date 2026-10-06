@@ -340,9 +340,10 @@ struct llama_layer {
     // MoE expert cache (hot/cold split): GPU-resident packs of the S most
     // frequently routed experts of a CPU-offloaded layer + id remap tables.
     // Cold side reuses the original ffn_*_exps tensors with hot ids masked to -1.
-    struct ggml_tensor * ffn_gate_exps_hot = nullptr;
-    struct ggml_tensor * ffn_down_exps_hot = nullptr;
-    struct ggml_tensor * ffn_up_exps_hot   = nullptr;
+    struct ggml_tensor * ffn_gate_exps_hot    = nullptr;
+    struct ggml_tensor * ffn_down_exps_hot    = nullptr;
+    struct ggml_tensor * ffn_up_exps_hot      = nullptr;
+    struct ggml_tensor * ffn_gate_up_exps_hot = nullptr; // fused gate_up layout
     struct ggml_tensor * moe_map_hot       = nullptr; // i32[n_expert]: pack slot or -1
     struct ggml_tensor * moe_map_cold      = nullptr; // i32[n_expert]: global id or -1
     struct ggml_tensor * ffn_gate_inp_b    = nullptr;
