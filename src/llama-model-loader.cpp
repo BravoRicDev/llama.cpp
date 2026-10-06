@@ -1,6 +1,7 @@
 #include "llama-model-loader.h"
 
 #include "ggml-alloc.h"
+#include "ggml-cpu.h"
 #include "ggml.h"
 #include "gguf.h"
 #include "llama-hparams.h"
@@ -1120,7 +1121,10 @@ struct ggml_tensor * llama_model_loader::borrow_shared_tensor(const LLM_TN_IMPL 
         get_key(LLM_KV_NEXTN_SHARED_TARGET_TENSORS, shared, false);
         shared_target_tensors = shared ? 1 : 0;
     }
-    if (shared_target_tensors == 0) {
+    // Older DFlash GGUFs omit the metadata flag and instead fall back to
+    // ctx_other in the decoder graph. Materialize the same shared weights here
+    // so CPU placement is applied before context/compute-buffer allocation.
+    if (shared_target_tensors == 0 && !(get_arch() == LLM_ARCH_DFLASH && model_shared != nullptr)) {
         return nullptr;
     }
 
@@ -1140,6 +1144,9 @@ struct ggml_tensor * llama_model_loader::borrow_shared_tensor(const LLM_TN_IMPL 
             src = t;
             break;
         }
+    }
+    if (src == nullptr && tn.tensor == LLM_TENSOR_OUTPUT && tn.suffix && strcmp(tn.suffix, "scale") == 0) {
+        return nullptr; // optional output scale, absent on most target models
     }
     if (src == nullptr) {
         throw std::runtime_error(format("%s: draft needs tensor '%s' from the target, which does not have it",
@@ -1173,9 +1180,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     // set below, before buft_for_tensor() runs
     bool is_lazy = false;
+    bool is_shared_copy = false;
 
     auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
-        const ctx_key key { buft, is_lazy };
+        const ctx_key key { buft, is_lazy, is_shared_copy };
 
         auto it = ctx_map.find(key);
         if (it == ctx_map.end()) {
@@ -1390,6 +1398,25 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
     // must precede check_tensor_dims, and must win over the arch fallback that ties output to token_embd
     if (ggml_tensor * shared = borrow_shared_tensor(tn, ne)) {
+        // Respect CPU placement even for tensors absent from the draft GGUF.
+        // Returning the target's GPU output weight would schedule the draft's
+        // projection on CUDA despite --spec-draft-ngl 0.
+        // The placement probe attaches a dummy buffer to metadata. Never pass
+        // the live target tensor: its buffer is already owned by that model.
+        ggml_tensor shared_meta = *shared;
+        shared_meta.buffer = nullptr;
+        shared_meta.data = nullptr;
+        const auto wanted = buft_for_tensor(&shared_meta);
+        if (wanted && ggml_backend_buft_is_host(wanted) && shared->buffer &&
+                !ggml_backend_buffer_is_host(shared->buffer)) {
+            is_shared_copy = true;
+            ggml_tensor * copy = ggml_dup_tensor(ctx_for_buft(ggml_backend_cpu_buffer_type()), shared);
+            ggml_set_name(copy, tn.str().c_str());
+            shared_tensor_copies.emplace(copy, shared);
+            LLAMA_LOG_INFO("%s: private CPU copy of shared tensor %s (%zu bytes)\n",
+                    __func__, tn.str().c_str(), ggml_nbytes(copy));
+            return copy;
+        }
         return shared;
     }
 
@@ -1683,6 +1710,14 @@ bool llama_model_loader::load_all_data(
     }
 
     for (struct ggml_tensor * cur : tensors) {
+        const auto shared = shared_tensor_copies.find(cur);
+        if (shared != shared_tensor_copies.end()) {
+            GGML_ASSERT(cur->buffer && ggml_backend_buffer_is_host(cur->buffer));
+            ggml_backend_tensor_copy(shared->second, cur);
+            LLAMA_LOG_INFO("%s: shared tensor %s copied once to %s\n", __func__,
+                    ggml_get_name(cur), ggml_backend_buffer_name(cur->buffer));
+            continue; // no file weight and no contribution to size_data
+        }
         const auto * weight = get_weight(ggml_get_name(cur));
         if (weight == nullptr) {
             // this can happen with split experts models

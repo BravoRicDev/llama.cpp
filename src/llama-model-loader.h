@@ -122,6 +122,9 @@ struct llama_model_loader {
     // cached nextn_shared_target_tensors, -1 until first read
     int shared_target_tensors = -1;
 
+    // CPU draft copies of target-owned GPU weights; owned by the draft's contexts.
+    std::map<ggml_tensor *, const ggml_tensor *> shared_tensor_copies;
+
     llama_files files;
     llama_ftype ftype;
     llama_fver  fver;
@@ -156,10 +159,14 @@ struct llama_model_loader {
     struct ctx_key {
         ggml_backend_buffer_type_t buft;
         bool lazy;
+        bool shared_copy = false; // not backed by this GGUF's mmap
     };
 
     struct ctx_key_comparator {
         bool operator()(const ctx_key & lhs, const ctx_key & rhs) const {
+            if (lhs.shared_copy != rhs.shared_copy) {
+                return lhs.shared_copy < rhs.shared_copy;
+            }
             if (lhs.lazy != rhs.lazy) {
                 return lhs.lazy < rhs.lazy;
             }
